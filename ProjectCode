@@ -1,0 +1,569 @@
+/*****************************************
+MECH 458 - Project Code V2
+STUDENT 1: Sema-May Hamidi	 V00811695
+STUDENT 2: Stuart Perfect	 V00831818
+*****************************************
+In this version: 
+- Acceleration done for constant delayMin
+- Initialization of the stepper done
+- Choosing rotation direction done for max efficiency
+- Attempt 1 to implement linked list for the parts
+- Sort into either white or steel based on ferromagnetic sensor on each restart
+- FIFO error found: in Dequeue added case when *head=null
+- Added pause service routine
+*/
+#include<avr/io.h>
+#include<avr/interrupt.h>
+#include<stdlib.h>
+#include "LinkedQueue-edit.h"
+
+//global variables
+volatile int current = 0;
+volatile int stepLocation = 0;			//Which bin currentlt on ( 0 = Steel,1 = White,2 = Aluminun,3 = Black)
+volatile int delay = 20;				//stepper time delay
+volatile int delayMin = 10;				//MINIMUM DELAY for the stepper
+volatile int pauseCount = 0;			//how many times has the pause button been pushed
+
+volatile int blackCount = 0;
+volatile int whiteCount = 0;
+volatile int aluminumCount = 0;
+volatile int steelCount = 0;
+
+volatile int lastW = 1;					//what direction we went last time
+volatile unsigned char ADC_result;
+volatile unsigned char ADC_result_flag;
+
+
+//step values given in lab
+int array[4] = {0b00110000, 0b00000110, 0b00101000, 0b00000101};
+
+
+void mTimer(int count);
+void rotate(int newLocation);
+void clockwise(int step);
+void implementADC();
+void initLocate();
+int stepperAccelDecel (int steps, int position, int direction);
+
+/******************* STRUCT FOR PART DATA *********************/
+/*
+typedef struct partData {
+   int s0Ferro = 0;				//1 = metal, 0 = non-metal 
+   int S1Light = 0;				//1 = light, 0 = dark
+   int matl = 0;				//0 = steel, 1 = white, 2 = aluminum, 3 = black
+} partData;
+*/
+
+
+/***************** INITIALIZE LINKED LIST *******************/
+char outData;					//storage for output data
+	
+//code from lab3, change names to be more desciptive later
+volatile link *head; 
+volatile link *tail;				//set up head and tail pointers
+volatile link *newLink; 
+volatile link *rtnLink;		//set up pointers to new links and returned links ?????? NEED TO MAKE VOLITILE?????
+
+
+/*************************** MAIN *****************************/
+int main(int argc, char *argv[]) {
+
+
+	TCCR1B|=_BV(CS10);	//runs timer off CPU clock 
+	cli();				//disable all interrupts   
+
+	DDRB=0xff;	//output to motor
+	DDRA=0xff;	//output to stepper
+	DDRF=0x00;	//input ADC
+	DDRC=0xff;	//output LED
+
+	PORTB=PORTB&0b00000011;	//select PORTB bits
+	
+	/*********************** SET PWM ****************************/
+	
+	TCCR0A|=_BV(WGM00);				//STEP1-set to fast mode
+	TCCR0A|=_BV(WGM01);
+
+	//TIMSK0|=_BV(OCIE0A);			//STEP2-enable compare for Timer 0 in mask register
+
+	TCCR0A|=_BV(COM0A1);			//STEP3-clear output compare, set when it reaches the TOP (0xff)
+
+	TCCR0B|=_BV(CS01);				//STEP4-set clock bit
+	OCR0A = 0x50;					//SETS BELT SPEED (50% = 0x80)
+
+	
+	/*************** ADC/INTERRUPT INITIALIZATION ***************/
+
+	sei();							//enable GLOBAL interrupt
+
+	EIMSK|=_BV(INT0);				//enable INT0 for ramp down (button push)
+	EICRA|=_BV(ISC01);				//set for falling edge
+	
+	EIMSK|=_BV(INT0);				//enable INT1 for pause (button push)
+	EICRA|=_BV(ISC01);				//set for falling edge
+
+	EIMSK|=_BV(INT2);				//enable INT2 for S0 optical sensor (OI)
+	EICRA|=_BV(ISC21);				//set for falling edge
+
+	EIMSK|=_BV(INT3);				//enable INT3 for S0 ferromagnetic sensor (IN)
+	EICRA|=_BV(ISC31);				//set for falling edge
+	
+	EIMSK|=_BV(INT4);				//enable INT4 for S1 optical sensor (OI)
+	EICRB|=_BV(ISC41)|_BV(ISC40);	//set for rising edge
+
+	EIMSK|=_BV(INT5);				//enable INT5 for S2 optical exit sensor (EX)
+	EICRB|=_BV(ISC51);				//set for falling edge
+	
+	ADCSRA|=_BV(ADEN);				//enable ADC
+	ADCSRA|=_BV(ADIE);				//enable ADC interrupt
+	ADMUX|=_BV(ADLAR)|_BV(REFS0);	//ADC reference selection, left adujust
+
+	ADCSRA|=_BV(ADSC);				//initialize ADC
+
+	*newLink = NULL;				//initialize new links to NULL
+	*rtnLink = NULL;
+	setup(&head, &tail);			//Setup linked list.
+
+	//define ranges for ADC result comparison, adjust as neede
+	int lightMin = 0;
+	int lightMax = 0;
+	int darkMin = 0;
+	int darkMax = 0;
+	
+	
+	/*************** TESTING COMMANDS HERE *****************/
+	PORTC = 0xff;
+	initLocate();
+	mTimer(100);
+	PORTC = 0x00;
+	PORTB = 0b00100000;	//Turn on motor
+	while (1);
+}
+
+/***************** INTERRUPT SERVICE ROUTINES *******************/
+ISR(INT0_vect){		
+	PORTB = 0x00;				//RAMP DOWN
+	//if there are still items in the linked list, continue until they're sorted
+}
+
+ISR(INT1_vect){						//PAUSE
+	
+	if((pauseCount%2)==0) {			//check if we're in a pause already
+		PORTB = 0x00;				//stop the belt
+		
+		int i;
+
+		for(i=0; i<4; i++) {		//for each of the four types, display count
+		
+			if(i == 0) {
+				PORTC = 0b10000000 + steelCount;
+				mTimer(1500);
+			}
+			else if(i == 1) {
+				PORTC = 0b01000000 + whiteCount;
+				mTimer(1500);
+			}
+			else if(i == 2) {
+				PORTC = 0b00100000 + aluminumCount;
+				mTimer(1500);
+			}
+			else {
+				PORTC = 0b00010000 + blackCount;
+				mTimer(1500);
+			}
+		}
+		PORTC = 0x00;
+		pauseCount++;
+	}
+	else {
+		PORTB = 0b00100000;
+		pauseCount++;
+	}
+}
+
+ISR(INT2_vect){						//S0 OPTICAL SENSOR
+
+	//initialize a linked list item for the new part
+	initLink(&newLink);
+	
+	//enqueue the new part
+	enqueue(&head, &tail, &newLink);
+	tail->p.s0Ferro = 0;
+	tail->p.s1Light = 0;
+	tail->p.matl = 0;
+	PORTC = 0b00000001;
+}
+
+ISR(INT3_vect){						//S0 FERROMAGNETIC SENSOR
+	
+	//default is plastic, so if tripped, then it's metal
+	head->p.s0Ferro = 1;
+	PORTC = 0b00000011;
+
+}
+
+ISR(INT4_vect){						//S1 OPTICAL SENSOR
+	//start taking ADC readings white it is seeing a part
+}
+
+ISR(ADC_vect){						//ADC SERVICE ROUTINE
+	ADC_result=ADCH;
+	ADC_result_flag = 1;
+}
+
+ISR(INT5_vect){						//S2 EXIT OPTICAL SENSOR
+		
+	//dequeue the first item in the list and read the data
+	if(head->p.s0Ferro == 1){
+		head->p.matl = 0;
+		PORTC = 0b00000111;
+	}
+	else{
+		head->p.matl = 1;
+		//PORTC = 0b00000111;
+	}
+		
+	PORTB = 0x00;
+	rotate(head->p.matl);
+		
+	//turn the belt back on
+	PORTB = 0b00100000;
+	//mTimer(100);
+	dequeue(&head, &rtnLink);
+		
+}
+
+/********************* STEPPER INITIALIZATION ******************/
+void initLocate(){					
+
+	int steps = 200;				//number of steps (360 Degrees)	
+	int position = current;
+	int i = 0;						//counter for loop
+	int x = 0;						//time delay for loop
+
+	while((PIND & 0b00010000) == 0b00010000){
+			
+			position++;
+			i++;					//increase step position by 1
+
+			if(i<delayMin)			// Accelerator for locate.
+				x = delay-i;
+			
+			else
+				x = delayMin;
+							
+		
+		if(position==4)				//if it makes one full cycle through the array
+			position=0;				//reset position to 0
+			
+
+	PORTA = array[position];		//store the position in PORTA from correct place in the array
+	mTimer(x);						//wait
+	}//end while loop
+
+	stepLocation = 3;				//Sets the global step location to Black
+	
+	current = position;				//put as current position
+}//end InitLocate
+
+
+/************* GENERAL ROTATE FUNCTION *************/
+//function for to rotate, CCW: '+', CW: '-'
+void rotate(int newLocation){			//INPUT position to rotate to (0, 1, 2, or 3)
+
+	int degrees;	 
+	
+	if(stepLocation == newLocation)		//if new location is same as current
+		return;
+
+	if(stepLocation == 0){				//if on steel
+		if(newLocation == 1)
+			degrees = -90;
+
+		else if(newLocation == 2)
+			degrees = 180*lastW;			
+
+		else if(newLocation == 3)
+		degrees = 90;
+	}//end if on steel
+	
+	else if(stepLocation == 1){			//if on white
+		if(newLocation == 0)
+			degrees = 90;
+
+		else if(newLocation == 2)
+			degrees = -90;
+		
+		else if(newLocation == 3)
+			degrees = 180*lastW;
+	}//end if on white
+
+	else if(stepLocation == 2){			//if on aluminum
+		if(newLocation == 0)
+			degrees = 180*lastW;
+		
+		else if(newLocation == 1)
+			degrees = 90;
+		
+		else if(newLocation == 3)
+			degrees = -90;
+	}//end if on aluminum
+
+	else if(stepLocation == 3){			//if on black
+		if(newLocation == 0)
+			degrees = -90;
+		
+		else if(newLocation == 1)
+			degrees = 180*lastW;
+		
+		else if(newLocation == 2)
+			degrees = 90;
+	}//end if on black
+		
+	else{
+		return;
+	}
+	
+	int steps = degrees/1.8;					//initialize steps to goal
+	int position = current;						//starting point
+
+	
+	//counter-clockwise
+	if (steps > 0) {	
+		current = stepperAccelDecel (steps, position, 1);
+		lastW = 1;
+	}
+
+	//clockwise
+	else{		
+		current = stepperAccelDecel (steps, position, -1);
+		lastW = -1;
+	}
+	
+	stepLocation = newLocation;
+
+}//end rotate
+
+/************* STEPPER ACCELERATION/DECELLERATION ***********/
+// return position
+int stepperAccelDecel (int steps, int position, int direction) {
+	for (int i=0; i<abs(steps); i++) {
+
+		int delayStep = 1;			//delay jump to reach min in 10 steps
+		position += direction;		//step
+			
+		if (i<10) {					//ACCELERATE			
+			delay -= delayStep;		//decrease delay
+		}
+
+		else if (i<(abs(steps)-10)) {	//HOLD SPEED
+		}
+
+		else {						//DECELERATE
+			delay += delayStep;		//increase delay
+		}
+			
+		if (position == 4)			//if it makes full CCW roation
+			position = 0;			//reset position	
+		if (position == (-1))		//if it makes full CW roation
+			position = 3;			//reset position
+
+		mTimer(delay);	
+		PORTA = array[position];	//store the position
+	}
+	return position;
+}
+
+/************* TIMER FUNCTION FROM LAB 2 ***********/
+void mTimer(int count){
+
+	//declare variables
+	
+	int i;	//initialize i at 0
+	i = 0;
+
+	//set the waveform generator - clear timer
+
+	TCCR1B|= _BV(WGM12);	//set WGM bits to 0100 - also resets the timer 
+
+	//set Output Compare register for 1000 cycles = 1ms
+	OCR1A = 0x03e8;
+
+	//set the initial value of the Timer Counter to 0x0000
+	TCNT1 = 0x0000;
+
+	//enable the output compare interrupt 1
+	//TIMSK1=TIMSK1|0b00000010;
+
+	//we want to clear the flag and begin timer when we reach the output compare value
+	TIFR1|=_BV(OCF1A);
+
+	//keep track of the timer to find out when it does reach the output compare value
+	while (i<count){
+		if ((TIFR1 & 0x02) == 0x02){
+			
+			TIFR1 |=_BV(OCF1A);			//clear the flag by writing a 1 to the bit
+
+			i++;						//increment the counter
+		} //end if
+	} //end while
+	return;
+}
+
+/************* FIFO LINKED LIST FUNCTIONS ***********/
+
+/**************************************************************************************
+* DESC: initializes the linked queue to 'NULL' status
+* INPUT: the head and tail pointers by reference
+*/
+
+void setup(link **h,link **t){
+	*h = NULL;		/* Point the head to NOTHING (NULL) */
+	*t = NULL;		/* Point the tail to NOTHING (NULL) */
+	return;
+}/*setup*/
+
+
+
+
+/**************************************************************************************
+* DESC: This initializes a link and returns the pointer to the new link or NULL if error 
+* INPUT: the head and tail pointers by reference
+*/
+void initLink(link **newLink){
+	//link *l;
+	*newLink = malloc(sizeof(link));
+	(*newLink)->next = NULL;
+	return;
+}/*initLink*/
+
+
+
+
+/****************************************************************************************
+*  DESC: Accepts as input a new link by reference, and assigns the head and tail		
+*  of the queue accordingly				
+*  INPUT: the head and tail pointers, and a pointer to the new link that was created 
+*/
+/* will put an item at the tail of the queue */
+void enqueue(link **h, link **t, link **nL){
+
+	if (*t != NULL){
+		/* Not an empty queue */
+		(*t)->next = *nL;
+		*t = *nL; //(*t)->next;
+	}/*if*/
+	else{
+		/* It's an empty Queue */
+		//(*h)->next = *nL;
+		//should be this
+		*h = *nL;
+		*t = *nL;
+	}/* else */
+	return;
+}/*enqueue*/
+
+
+
+
+/**************************************************************************************
+* DESC : Removes the link from the head of the list and assigns it to deQueuedLink
+* INPUT: The head and tail pointers, and a ptr 'deQueuedLink' 
+* 		 which the removed link will be assigned to
+*/
+/* This will remove the link and element within the link from the head of the queue */
+void dequeue(link **h, link **deQueuedLink){
+	/* ENTER YOUR CODE HERE */
+	*deQueuedLink = *h;	// Will set to NULL if Head points to NULL
+	/* Ensure it is not an empty queue */
+	if (*h != NULL){
+		*h = (*h)->next;
+	}/*if*/
+
+	if(*h = NULL){
+		*t = NULL;
+	}
+	
+	return;
+}/*dequeue*/
+
+
+
+
+/**************************************************************************************
+* DESC: Peeks at the first element in the list
+* INPUT: The head pointer
+* RETURNS: The element contained within the queue
+*/
+/* This simply allows you to peek at the head element of the queue and returns a NULL pointer if empty */
+partData firstValue(link **h){
+	return((*h)->p);
+}/*firstValue*/
+
+
+
+
+
+/**************************************************************************************
+* DESC: deallocates (frees) all the memory consumed by the Queue
+* INPUT: the pointers to the head and the tail
+*/
+/* This clears the queue */
+void clearQueue(link **h, link **t){
+
+	link *temp;
+
+	while (*h != NULL){
+		temp = *h;
+		*h=(*h)->next;
+		free(temp);
+	}/*while*/
+	
+	/* Last but not least set the tail to NULL */
+	*t = NULL;		
+
+	return;
+}/*clearQueue*/
+
+
+
+
+
+/**************************************************************************************
+* DESC: Checks to see whether the queue is empty or not
+* INPUT: The head pointer
+* RETURNS: 1:if the queue is empty, and 0:if the queue is NOT empty
+*/
+/* Check to see if the queue is empty */
+char isEmpty(link **h){
+	/* ENTER YOUR CODE HERE */
+	return(*h == NULL);
+}/*isEmpty*/
+
+
+
+
+
+/**************************************************************************************
+* DESC: Obtains the number of links in the queue
+* INPUT: The head and tail pointer
+* RETURNS: An integer with the number of links in the queue
+*/
+/* returns the size of the queue*/
+int size(link **h, link **t){
+
+	link 	*temp;			/* will store the link while traversing the queue */
+	int 	numElements;
+
+	numElements = 0;
+
+	temp = *h;			/* point to the first item in the list */
+
+	while(temp != NULL){
+		numElements++;
+		temp = temp->next;
+	}/*while*/
+	
+	return(numElements);
+}/*size*/
+
